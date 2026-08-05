@@ -1,6 +1,5 @@
 # PTO Virtual micro Instruction (`pto.vmi`)
 
-- v0.2: TBD
 - v0.1: Doc init. Per-op reference for all `pto.vmi` ops, with syntax,
   semantics, operand tables, lowering notes, and lit-test examples.
 
