@@ -1021,9 +1021,10 @@ declaring the memory access pattern. Default is `"continuous"`.
 #### `pto.vmi.vand` / `pto.vmi.vor` / `pto.vmi.vxor`
 
 - **semantics:** Elementwise bitwise AND / OR / XOR. Operands and result are
-  vregs by default; will also support mask-typed operands, performing a per-lane
-  predicate boolean op and yielding a mask (the data operands themselves are
-  masks, distinct from the governing `mask`).
+  vregs by default. These ops also accept mask-typed operands, performing a
+  per-lane predicate boolean op and yielding a mask. When the operands are
+  masks (predicate type), no governing `mask` operand may be given — a mask
+  operand would be ambiguous with the predicate data operands themselves.
 
   ```c
   for (int i = 0; i < L; i++)
@@ -1032,9 +1033,14 @@ declaring the memory access pattern. Default is `"continuous"`.
 
 - **syntax:**
   ```mlir
+  // vreg operands (optional governing mask)
   %r = pto.vmi.vand %lhs, %rhs, %mask : !pto.vmi.vreg<L×T>, !pto.vmi.vreg<L×T>, !pto.vmi.mask<L> -> !pto.vmi.vreg<L×T>
+
+  // mask operands (no governing mask)
+  %r = pto.vmi.vand %lhs, %rhs : !pto.vmi.mask<L>, !pto.vmi.mask<L> -> !pto.vmi.mask<L>
+  %r = pto.vmi.vxor %lhs, %rhs : !pto.vmi.mask<L>, !pto.vmi.mask<L> -> !pto.vmi.mask<L>
   ```
-- **datatypes:** `i8`–`i32` (integer bitwise)
+- **datatypes:** `i8`–`i32` (integer bitwise); `pred` (per-lane boolean op)
 - **lowering to `pto.mi`:**
   ```
   K × pto.vand / pto.vor / pto.vxor
@@ -1044,9 +1050,10 @@ declaring the memory access pattern. Default is `"continuous"`.
 #### `pto.vmi.vnot`
 
 - **semantics:** Elementwise bitwise NOT. Operand and result are vregs by
-  default; will also support a mask-typed operand, performing a per-lane predicate
-  complement and yielding a mask (the data operand itself is a mask, distinct
-  from the governing `mask`).
+  default. This op also accepts a mask-typed operand, performing a per-lane
+  predicate complement and yielding a mask. When the operand is a mask
+  (predicate type), no governing `mask` operand may be given — a mask operand
+  would be ambiguous with the predicate data operand itself.
 
   ```c
   for (int i = 0; i < L; i++)
@@ -1055,9 +1062,13 @@ declaring the memory access pattern. Default is `"continuous"`.
 
 - **syntax:**
   ```mlir
+  // vreg operand (optional governing mask)
   %r = pto.vmi.vnot %src, %mask : !pto.vmi.vreg<L×T>, !pto.vmi.mask<L> -> !pto.vmi.vreg<L×T>
+
+  // mask operand (no governing mask)
+  %r = pto.vmi.vnot %src : !pto.vmi.mask<L> -> !pto.vmi.mask<L>
   ```
-- **datatypes:** `i8`–`i32`
+- **datatypes:** `i8`–`i32`; `pred` (predicate complement)
 - **lowering to `pto.mi`:**
   ```
   K × pto.vnot
@@ -2352,15 +2363,26 @@ or fusing at the `pto.mi` layer is the workaround.
   ```
 
 
-> **Mask Boolean Ops (`vand` / `vor` / `vxor` / `vnot` on masks):**
->
-> There is **no dedicated predicate-logic op** (e.g. `pand`/`por`/`pxor`/`pnot`).
-> Mask (predicate) boolean operations are **not yet supported**, but are planned.
-> The planned approach is to **reuse the elementwise bitwise ops** `pto.vmi.vand` /
-> `vor` / `vxor` / `vnot` directly on mask operands — their implementations will be
-> extended to accept mask types (treated as a per-lane bit-wise boolean op on the
-> predicate). This also covers the `pnot`-style predicate complement needed by MERGE
-> emulation (see Appendix C).
+### Mask Boolean Ops (`vand` / `vor` / `vxor` / `vnot` on masks)
+
+The elementwise bitwise ops are reused directly on mask operands, treated as a
+per-lane bit-wise boolean op on the predicate.
+
+- **example:**
+  ```mlir
+  // Predicate boolean ops on masks
+  %and = pto.vmi.vand %lt, %gt
+      : !pto.vmi.mask<128xpred>, !pto.vmi.mask<128xpred>
+      -> !pto.vmi.mask<128xpred>
+  %or = pto.vmi.vor %lt, %gt
+      : !pto.vmi.mask<128xpred>, !pto.vmi.mask<128xpred>
+      -> !pto.vmi.mask<128xpred>
+  %xor = pto.vmi.vxor %lt, %gt
+      : !pto.vmi.mask<128xpred>, !pto.vmi.mask<128xpred>
+      -> !pto.vmi.mask<128xpred>
+  %not = pto.vmi.vnot %lt
+      : !pto.vmi.mask<128xpred> -> !pto.vmi.mask<128xpred>
+  ```
 
 ---
 
