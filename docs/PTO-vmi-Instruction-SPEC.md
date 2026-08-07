@@ -771,16 +771,27 @@ declaring the memory access pattern. Default is `"continuous"`.
 
 ### `pto.vmi.vci`
 
-- **semantics:** Generate a per-lane index/counter vector from a single scalar base such as `[base, base±1, base±2, ...]`,  lane `i` gets `base + i` (ASC) or `base - i` (DESC). It is the index source for `vgather`/`vscatter` offsets.
+- **semantics:** Generate a per-lane index/counter vector from a single scalar base such as `[base, base±1, base±2, ...]`, lane `i` gets `base + i` (ASC) or `base - i` (DESC). It is the index source for `vgather`/`vscatter` offsets.
 
   ```c
   for (int i = 0; i < L; i++)
       dst[i] = base + (order == "ASC" ? i : -i);
   ```
 
+  With `group=C>1`, each group of `S=L/C` lanes restarts the ramp:
+
+  ```c
+  dst[g*S + j] = base + (order == "ASC" ? j : -j);
+  ```
+
+  `group=1` is normalized to ordinary continuous `iota`, so it has exactly the
+  same semantics and tail support as omitting `group`. Group-periodic iota is
+  an internal contiguous-only producer; layout assignment inserts
+  `ensure_layout` when a consumer requests a deinterleaved layout.
+
 - **syntax:**
   ```mlir
-  %result = pto.vmi.vci %base {order = "ASC"} : T -> !pto.vmi.vreg<L×T>
+  %result = pto.vmi.vci %base {order = "ASC", group = 2} : T -> !pto.vmi.vreg<L×T>
   ```
 - **operands:**
 
@@ -799,6 +810,7 @@ declaring the memory access pattern. Default is `"continuous"`.
   | Attribute | Values | Default | Description |
   |---|---|---|---|
   | `order` | `"ASC"`, `"DESC"` | `"ASC"` | Index generation direction |
+  | `group` | positive integer | omitted | Number of equal groups. `1` is equivalent to omitted; values greater than one restart the ramp per group. |
 
 - **lowering to `pto.mi`:**
   ```
@@ -827,7 +839,9 @@ declaring the memory access pattern. Default is `"continuous"`.
 
 ## Group 3: Eltwise Compute
 
-> **Category:** A (layout-passthrough). **Mask:** `Pg` (optional governing predicate, except `vselr` which has none).
+> **Category:** A (layout-passthrough) for ordinary per-lane operations;
+> `vselr` is classified separately as Category C below. **Mask:** `Pg`
+> (optional governing predicate, except `vselr` which has none).
 >
 > Pure per-lane ops. Layout passes through unchanged. An operand whose
 > cardinality along an axis is 1 becomes a broadcast (replicate-read, never
@@ -841,7 +855,7 @@ declaring the memory access pattern. Default is `"continuous"`.
 - **semantics:** Unified fp/int elementwise add / subtract / multiply.
 
   ```c
-  for (int i = 0; i < L; i++)
+  for (int i = 0; i < N; i++)
       dst[i] = mask[i] ? lhs[i] + rhs[i] : (pmode_merge ? dst_old[i] : 0);
   ```
 
@@ -1157,9 +1171,12 @@ scalar type must match the vector element type.
 
 - **syntax:**
   ```mlir
-  %r = pto.vmi.vshls %src, %scalar, %mask : !pto.vmi.vreg<L×T>, T, !pto.vmi.mask<L> -> !pto.vmi.vreg<L×T>
+  %r = pto.vmi.vshls %src, %shift, %mask : !pto.vmi.vreg<L×T>, i16, !pto.vmi.mask<L> -> !pto.vmi.vreg<L×T>
   ```
-- **datatypes:** `i8`–`i32`
+- **datatypes:** `T` is an integer type from 8 to 32 bits. The uniform shift
+  amount is a signless `i16` value independent of `T` and should be in the
+  range `[0, bitwidth(T))`. For `vshrs`, the signedness of `T` determines
+  whether the right shift is arithmetic or logical.
 - **lowering to `pto.mi`:**
   ```
   K × pto.vshls / pto.vshrs
@@ -1335,47 +1352,55 @@ scalar type must match the vector element type.
 
 #### `pto.vmi.vselr`
 
+- **layout contract:** Category C (contiguous-required). Source, index, and
+  result use contiguous layout; an arbitrary input layout is not passed through
+  this operation. Compilation may materialize a contiguous representation at
+  this boundary. IR that reaches this operation with an assigned
+  non-contiguous layout is unsupported.
+
 - **semantics:** Dynamic lane permutation: `result[i] = source[index[i]]`.
 
   ```c
-  for (int i = 0; i < L; i++)
+  for (int i = 0; i < N; i++)
       dst[i] = src[index[i]];
   ```
 
 - **syntax:**
   ```mlir
-  %r = pto.vmi.vselr %source, %index : !pto.vmi.vreg<L×T>, !pto.vmi.vreg<L×index_T> -> !pto.vmi.vreg<L×T>
+  %r = pto.vmi.vselr %source, %index : !pto.vmi.vreg<N×T>, !pto.vmi.vreg<N×index_T> -> !pto.vmi.vreg<N×T>
   ```
 - **operands:**
 
   | Operand | Type | Description |
   |---|---|---|
-  | `source` | `!pto.vmi.vreg<L×T>` | Source vector to permute from |
-  | `index` | `!pto.vmi.vreg<L×index_T>` | Per-lane source lane index |
+  | `source` | `!pto.vmi.vreg<N×T>` | Source vector to select from |
+  | `index` | `!pto.vmi.vreg<N×index_T>` | Per-lane source lane index |
 
 - **results:**
 
   | Result | Type | Description |
   |---|---|---|
-  | `result` | `!pto.vmi.vreg<L×T>` | Permuted result |
+  | `result` | `!pto.vmi.vreg<N×T>` | Permuted result |
 
-- **datatypes:** `i8`–`i32`, `f16`, `bf16`, `f32`
-- **lowering to `pto.mi:**
-  ```
-  K × pto.vselr (+ index reg setup)
-  ```
-  `#mi = K`, `dep = 1` (+1 for index setup). +1 index vreg.
+- **datatypes:** 8-, 16-, and 32-bit integer or floating-point source/result
+  elements; `index_T` must be an integer type with the same storage width as
+  `T`.
+- **constraints:** Source, index, and result have the same lane count. The
+  supported lane counts are `N ∈ {64, 128, 256}` for 8-bit elements,
+  `N ∈ {64, 128}` for 16-bit elements, and `N = 64` for 32-bit elements.
+  Every `index[i]` must identify a valid logical source lane; behavior is
+  unspecified for an out-of-range index.
 
 - **notes:**
   - This is the permute/gather class — it is the register-resident realization
     of a grouped broadcast.
   - `vselr` takes no mask; the index vector encodes the permutation directly.
-  - Not A5-native `vselrv2` (that form is not available on A5).
+  - `vselrv2` is not available on A5 and does not add other supported shapes.
 
 - **example:**
   ```mlir
   %r = pto.vmi.vselr %src, %idx
-      : !pto.vmi.vreg<64×f16>, !pto.vmi.vreg<4×i16> -> !pto.vmi.vreg<4×f16>
+      : !pto.vmi.vreg<128×f16>, !pto.vmi.vreg<128×i16> -> !pto.vmi.vreg<128×f16>
   ```
 
 ### 3.7 Carry / Borrow Ops (Not Provided)
@@ -1621,21 +1646,27 @@ or fusing at the `pto.mi` layer is the workaround.
 
 - **semantics:** Unified elementwise type conversion. The conversion direction
   is derived from the source and destination element types; the verifier
-  dispatches to one of six kinds:
+  dispatches to one of seven kinds:
 
   1. **FpWiden** — `fp → fp`, `|dst| > |src|` (e.g. `f16 → f32`,
      `bf16 → f32`, `fp8_e4m3 → f16`).
 
   2. **FpNarrow** — `fp → fp`, `|dst| < |src|` (e.g. `f32 → f16`,
-     `f32 → bf16`, `f32 → fp8_e4m3`).
+     `f32 → bf16`, `f32 → fp8_e4m3`). Same-width `fp → fp`
+     (`|dst| == |src|`, e.g. `bf16 → f16`).
 
-  3. **FpToSi** — `fp → int` (e.g. `f32 → i32`, `f16 → i8`).
+  3. **FpToSi** — `fp → signed int`. Supported pairs follow the contract
+     table `lookupVMIFpToSiContract`: `f32→s32`, `f16→s16`, `f32→s16`,
+     `f16→s8`, `f16→s32` (nosat), `bf16→s32`.
 
-  4. **SiToFp** — `int → fp` (e.g. `i32 → f32`, `i8 → f16`).
+  4. **FpToUi** — `fp → unsigned int`. Supported pairs follow the contract
+     table `lookupVMIFpToUIContract`: currently `f16→u8`.
 
-  5. **IntWiden** — `int → int`, `|dst| > |src|`.
+  5. **SiToFp** — `int → fp` (e.g. `i32 → f32`, `i8 → f16`).
 
-  6. **IntNarrow** — `int → int`, `|dst| < |src|`.
+  6. **IntWiden** — `int → int`, `|dst| > |src|`.
+
+  7. **IntNarrow** — `int → int`, `|dst| < |src|`.
 
 - **syntax:**
   ```mlir
@@ -1658,7 +1689,7 @@ or fusing at the `pto.mi` layer is the workaround.
   | Attribute | Values | Valid for | Description |
   |---|---|---|---|
   | `rounding` | `"R"` (nearest-even), `"A"` (away-from-zero), `"H"` (half-up), `"Z"` (toward-zero) | fp narrowing | Rounding mode |
-  | `saturate` | `"SAT"`, `"NOSAT"` | **required** for fp-narrow / int-narrow / fp→si | `SAT` clamps to ±max of the destination type; `NOSAT` performs a direct bit truncation of the result representation. |
+  | `saturate` | `"SAT"`, `"NOSAT"` | required for fp-narrow / int-narrow; for fp→si / fp→ui the requirement follows the vcvt contract's `requiresSat` (e.g. `f16→s8` required, `f16→s32` **forbidden** — no overflow possible; same-width `bf16→f16` required) | `SAT` clamps to ±max of the destination type; `NOSAT` performs a direct bit truncation of the result representation. |
 
 - **datatypes:** Source and destination from `{f32, f16, bf16, fp8_e4m3, fp8_e5m2, i32, i16, i8, ui32, ui16, ui8}`
 - **lowering to `pto.mi`:**
@@ -1669,6 +1700,8 @@ or fusing at the `pto.mi` layer is the workaround.
   | 8↔32 (radix-4) | widen: `UNPK_B8` + `vintlv` + `vcvt P0` + `punpack`; narrow: `PK4_B32` store (or `vselr` gather) + `ppack` | `2–3` | `2–3` |
   | f32→fp8 quant | `1 cast` + `PK4_B32` | `K` | `1` |
   | f32→int8 quant | 3-stage cast + `PK4_B32` | `~3K` | `3` |
+  | fp↔fp same-width (`bf16→f16`) | `K × vcvt` (1:1, no part) | `K` | `1` |
+  | fp→si / fp→ui | per contract pair: same-width 1:1, widen EVEN/ODD, narrow EVEN/ODD+Vor | `K`–`~3K` | `2`–`3` |
   | int↔int (same width) | `K × vtrc` or `K × vcvt` | `K` | `1` |
 
 - **example:**
@@ -1698,6 +1731,15 @@ or fusing at the `pto.mi` layer is the workaround.
   // f32 → i32 fp-to-si (saturate required)
   %r = pto.vmi.vcvt %x {saturate = "SAT"}
       : !pto.vmi.vreg<64×f32> -> !pto.vmi.vreg<64×i32>
+
+  // bf16 → f16 same-width fp-to-fp (VPTO contract pair, routed via FpNarrow;
+  // saturate required)
+  %h = pto.vmi.vcvt %g {saturate = "SAT"}
+      : !pto.vmi.vreg<128×bf16> -> !pto.vmi.vreg<128×f16>
+
+  // f16 → u8 fp-to-ui (unsigned; contract pair, saturate required)
+  %u = pto.vmi.vcvt %x {saturate = "SAT"}
+      : !pto.vmi.vreg<128×f16> -> !pto.vmi.vreg<128×ui8>
   ```
 
 - **notes:**
@@ -1713,7 +1755,8 @@ or fusing at the `pto.mi` layer is the workaround.
 ### `pto.vmi.vinterpret_cast`
 
 - **semantics:** Bitwise reinterpretation of a vector register — same bits,
-  different element type. No data movement, no layout change.
+  different element type. No data movement. The lane count may change so long
+  as the total number of bits is conserved.
 
   ```c
   // Same bits, reinterpreted element-by-element
@@ -2050,7 +2093,7 @@ or fusing at the `pto.mi` layer is the workaround.
 
   | Operand | Type | Description |
   |---|---|---|
-  | `acc`  | `!pto.vmi.vreg<L×{ui16|i16}>` | Carry-in accumulator; same shape as `result` (256-bin Bin_N0+Bin_N1, or 128-bin Bin_N0-only). Element type is `ui16` or signless `i16` (interpreted as unsigned); |
+  | `acc`  | `!pto.vmi.vreg<L×{ui16|i16}>` | Carry-in accumulator; same shape as `result` (256-bin Bin_N0+Bin_N1, or 128-bin Bin_N0-only). Element type is `ui16` or signless `i16` (interpreted as unsigned). |
   | `src`  | `!pto.vmi.vreg<L×{ui8|i8}>` | Source lanes to be binned; 8-bit element type is `ui8` or signless `i8` (interpreted as unsigned). |
   | `mask` | `!pto.vmi.mask<L>` | Governing predicate over source lanes. Does not gate `acc`. |
 
@@ -2058,7 +2101,7 @@ or fusing at the `pto.mi` layer is the workaround.
 
   | Result | Type | Description |
   |---|---|---|
-  | `result` | `!pto.vmi.vreg<L×{ui16|i16}>` | Bin counts on top of `acc` (half axis: Bin_N0/N1 pair, or Bin_N0-only). Element type is `ui16` or signless `i16` (interpreted as unsigned); |
+  | `result` | `!pto.vmi.vreg<L×{ui16|i16}>` | Bin counts on top of `acc` (half axis: Bin_N0/N1 pair, or Bin_N0-only). Element type is `ui16` or signless `i16` (interpreted as unsigned). |
 
 - **datatypes:** Source bin index: `ui8` or signless `i8`. Accumulator / result:
   `ui16` or signless `i16`. All are interpreted as
@@ -2120,7 +2163,7 @@ or fusing at the `pto.mi` layer is the workaround.
 
   | Operand | Type | Description |
   |---|---|---|
-  | `acc`  | `!pto.vmi.vreg<L×{ui16|i16}>` | Carry-in accumulator; same shape as `result` (256-bin full, or 128-bin when the source range is known to be < 128). Element type is `ui16` or signless `i16` (interpreted as unsigned); |
+  | `acc`  | `!pto.vmi.vreg<L×{ui16|i16}>` | Carry-in accumulator; same shape as `result` (256-bin full, or 128-bin when the source range is known to be < 128). Element type is `ui16` or signless `i16` (interpreted as unsigned). |
   | `src`  | `!pto.vmi.vreg<L×{ui8|i8}>` | Source lanes to be binned; 8-bit element type is `ui8` or signless `i8` (interpreted as unsigned). |
   | `mask` | `!pto.vmi.mask<L>` | Governing predicate over source lanes. Does not gate `acc`. |
 
@@ -2128,7 +2171,7 @@ or fusing at the `pto.mi` layer is the workaround.
 
   | Result | Type | Description |
   |---|---|---|
-  | `result` | `!pto.vmi.vreg<L×{ui16|i16}>` | Plain per-bin count vector on top of `acc` (256-bin full, or 128-bin when the source range is known to be < 128). Element type is `ui16` or signless `i16` (interpreted as unsigned); |
+  | `result` | `!pto.vmi.vreg<L×{ui16|i16}>` | Plain per-bin count vector on top of `acc` (256-bin full, or 128-bin when the source range is known to be < 128). Element type is `ui16` or signless `i16` (interpreted as unsigned). |
 
 - **datatypes:** Source bin index: `ui8` or signless `i8`. Accumulator / result:
   `ui16` or signless `i16`. All are interpreted as
@@ -2362,6 +2405,8 @@ or fusing at the `pto.mi` layer is the workaround.
       : index -> !pto.vmi.mask<256×b32>
   ```
 
+`num_groups` is logically legal for any positive divisor of the result mask
+lane count. A backend may impose a narrower materialization limit separately.
 
 ### Mask Boolean Ops (`vand` / `vor` / `vxor` / `vnot` on masks)
 
@@ -2529,7 +2574,7 @@ per-lane bit-wise boolean op on the predicate.
 | 29 | `pto.vmi.vcmp` | 3: Eltwise | A | Elementwise compare → mask |
 | 30 | `pto.vmi.vcmps` | 3: Eltwise | A | Vector-scalar compare → mask |
 | 31 | `pto.vmi.vsel` | 3: Eltwise | A | Predicate select |
-| 32 | `pto.vmi.vselr` | 3: Eltwise | A | Dynamic lane permute |
+| 32 | `pto.vmi.vselr` | 3: Eltwise | C | Dynamic lane select; contiguous, supported logical shape |
 | 33 | `pto.vmi.vbrc` | 4: Broadcast | A/B | Broadcast scalar/group-slot |
 | 34 | `pto.vmi.vcadd` | 5: Reduce | B | Add-reduction |
 | 35 | `pto.vmi.vcmax` | 5: Reduce | B | Max-reduction |
